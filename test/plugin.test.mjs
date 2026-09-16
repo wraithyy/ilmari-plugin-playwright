@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-const { default: plugin, buildArgs, parseReport, formatSummary } = await import("../dist/index.js");
+import plugin, { authDirFor, authEnvFor, buildArgs, formatSummary, parseReport, parseSteps, parseViewports, resolveBin, slugForUrl, totp } from "../dist/index.js";
 
 const nodeType = (type) => plugin.nodeTypes.find((n) => n.type === type);
 
@@ -231,11 +231,10 @@ test("entry is statically inspectable with the declared capabilities", async () 
   const { inspectPluginSource } = await import(`${src}/src/plugin-static.ts`);
   const result = inspectPluginSource(readFileSync(new URL("../dist/index.js", import.meta.url), "utf8"));
   assert.equal(result.ok, true, JSON.stringify(result));
-  assert.deepEqual(result.meta.capabilities, ["exec", "fs", "net"]);
-  assert.deepEqual(result.meta.nodeTypes.map((n) => n.type), ["playwright-test", "playwright-screenshot", "playwright-install"]);
+  assert.deepEqual(result.meta.capabilities, ["exec", "fs", "net", "secrets"]);
+  assert.deepEqual(result.meta.nodeTypes.map((n) => n.type), ["playwright-test", "playwright-screenshot", "playwright-login", "playwright-install"]);
 });
 
-const { resolveBin, slugForUrl, parseViewports } = await import("../dist/index.js");
 
 /** Fake CLI that also answers --version and writes an empty PNG for `screenshot`. */
 function fakePlaywrightCli() {
@@ -331,4 +330,178 @@ test("playwright-screenshot refuses an empty url list and bad viewports", async 
   assert.match(none.reason, /no urls/);
   const bad = await nodeType("playwright-screenshot").run({ bin: fakePlaywrightCli(), urls: "/", viewports: "wide" }, nodeCtx());
   assert.match(bad.reason, /invalid viewport/);
+});
+
+
+test("totp matches the RFC 6238 SHA-1 test vector", () => {
+  // secret "12345678901234567890" in base32, T=59 -> 94287082 -> last 6 digits
+  assert.equal(totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 59_000), "287082");
+  assert.equal(totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 1_111_111_109_000), "081804");
+});
+
+test("parseSteps reads the DSL and rejects unknown verbs", () => {
+  const r = parseSteps("# comment\nfill input[name=user] {user}\nclick button[type=submit]\nwait 500\nwaitUrl https://app/*\nexpect nav\npress #otp Enter");
+  assert.equal(r.steps.length, 6);
+  assert.deepEqual(r.steps[0], { verb: "fill", selector: "input[name=user]", value: "{user}" });
+  assert.deepEqual(r.steps[5], { verb: "press", selector: "#otp", value: "Enter" });
+  assert.match(parseSteps("hover #x").error, /unknown step/);
+  assert.match(parseSteps("fill onlyselector").error, /needs a selector and a value/);
+  assert.match(parseSteps("").error, /no steps/);
+});
+
+/** A stand-in for the playwright package: records what the runner does and
+ *  behaves like a logged-in session. */
+function fakePlaywrightModule({ token = "tok-123", failAt = -1 } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "ilmari-pw-mod-"));
+  const log = join(dir, "log.json");
+  writeFileSync(log, "[]");
+  const file = join(dir, "index.js");
+  writeFileSync(
+    file,
+    `import { readFileSync, writeFileSync } from "node:fs";
+     const record = (e) => { const l = JSON.parse(readFileSync(${JSON.stringify(log)}, "utf8")); l.push(e); writeFileSync(${JSON.stringify(log)}, JSON.stringify(l)); };
+     let url = "about:blank"; let n = 0;
+     const fail = ${failAt};
+     const step = (what) => { n += 1; record(what); if (fail >= 0 && n > fail) throw new Error("selector not found: " + JSON.stringify(what)); };
+     const locator = (sel) => ({ first: () => ({ fill: async (v) => step(["fill", sel, v]), click: async () => step(["click", sel]), press: async (k) => step(["press", sel, k]), waitFor: async () => step(["wait", sel]) }) });
+     const page = {
+       setDefaultTimeout() {},
+       async goto(u) { url = u; record(["goto", u]); },
+       locator,
+       async waitForTimeout(ms) { record(["sleep", ms]); },
+       async waitForURL(m) { url = "https://app.example.com/home"; record(["waitUrl"]); },
+       async evaluate(fn, key) { return key === "access_token" ? ${JSON.stringify(token)} : ""; },
+       url: () => url,
+       async screenshot({ path }) { writeFileSync(path, "png"); },
+     };
+     const context = {
+       async newPage() { return page; },
+       async storageState({ path }) { writeFileSync(path, JSON.stringify({ cookies: [{ name: "sid", value: "s3cret" }], origins: [] })); },
+       async cookies() { return [{ name: "sid", value: "s3cret" }]; },
+     };
+     export const chromium = { async launch() { return { async newContext() { return context; }, async close() { record(["close"]); } }; } };`,
+  );
+  return { module: file, log: () => JSON.parse(readFileSync(log, "utf8")) };
+}
+
+function loginCtx(overrides = {}) {
+  return nodeCtx({
+    taskId: `login-${Math.random().toString(16).slice(2, 8)}`,
+    pluginConfig: () => ({ loginUser: "tester@example.com", loginPassword: "pw-secret", loginTotpSecret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" }),
+    ...overrides,
+  });
+}
+
+test("playwright-login plays the steps with substituted secrets, saves storage state and a token, never prints them", async () => {
+  const fake = fakePlaywrightModule();
+  const ctx = loginCtx();
+  const res = await nodeType("playwright-login").run(
+    {
+      url: "https://app.example.com/login",
+      steps: "fill #email {user}\nclick #next\nfill #pw {password}\nfill #otc {totp}\nclick #submit\nwaitUrl https://app.example.com/*",
+      tokenFrom: "localStorage:access_token",
+      module: fake.module,
+    },
+    ctx,
+  );
+  assert.equal(res.ok, true, res.reason);
+  const log = fake.log();
+  assert.deepEqual(log[1], ["fill", "#email", "tester@example.com"]);
+  assert.deepEqual(log[3], ["fill", "#pw", "pw-secret"]);
+  assert.match(log[4][2], /^\d{6}$/, "totp placeholder becomes a 6-digit code");
+  const dir = authDirFor(ctx.taskId);
+  assert.ok(existsSync(join(dir, "storageState.json")));
+  assert.equal(readFileSync(join(dir, "token.txt"), "utf8"), "tok-123");
+  assert.ok(!dir.startsWith(ctx.workdir), "auth folder lives outside the worktree");
+  // the result names paths, not secrets
+  assert.equal(res.output.split("\n")[0], join(dir, "storageState.json"));
+  assert.ok(!res.output.includes("tok-123") && !res.output.includes("pw-secret") && !res.output.includes("s3cret"));
+  const started = ctx.events.find((e) => e.type === "playwright_login_started");
+  assert.ok(!JSON.stringify(started).includes("pw-secret"));
+  // a later playwright-test in the same run gets both files via env
+  assert.deepEqual(authEnvFor(ctx.taskId), {
+    PLAYWRIGHT_STORAGE_STATE: join(dir, "storageState.json"),
+    ILMARI_AUTH_TOKEN_FILE: join(dir, "token.txt"),
+  });
+});
+
+test("playwright-login fails with the step count, final url and a screenshot when a step breaks", async () => {
+  const fake = fakePlaywrightModule({ failAt: 2 });
+  const ctx = loginCtx();
+  const res = await nodeType("playwright-login").run(
+    { url: "https://app.example.com/login", steps: "fill #email {user}\nclick #next\nfill #pw {password}", module: fake.module },
+    ctx,
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.reason, /failed after 2 step\(s\)/);
+  assert.match(res.reason, /selector not found/);
+  assert.match(res.reason, /login-failed\.png/);
+  assert.ok(!res.reason.includes("pw-secret"));
+});
+
+test("playwright-login takes credentials from node params: a previous node's result or env:NAME", async () => {
+  const fake = fakePlaywrightModule();
+  process.env.PW_TEST_PASSWORD = "from-env";
+  const res = await nodeType("playwright-login").run(
+    { url: "https://app.example.com/login", steps: "fill #u {user}\nfill #p {password}", user: "{{secret.result}}", password: "env:PW_TEST_PASSWORD", module: fake.module },
+    nodeCtx({ outputs: { "secret.result": "from-node" }, pluginConfig: () => ({ loginUser: "cfg", loginPassword: "cfg" }) }),
+  );
+  delete process.env.PW_TEST_PASSWORD;
+  assert.equal(res.ok, true, res.reason);
+  const log = fake.log();
+  assert.deepEqual(log[1], ["fill", "#u", "from-node"]);
+  assert.deepEqual(log[2], ["fill", "#p", "from-env"]);
+});
+
+test("playwright-login refuses unconfigured placeholders, bad urls and bad tokenFrom", async () => {
+  const fake = fakePlaywrightModule();
+  const noCreds = await nodeType("playwright-login").run(
+    { url: "https://a.example.com", steps: "fill #pw {password}", module: fake.module },
+    nodeCtx({ pluginConfig: () => ({}) }),
+  );
+  assert.match(noCreds.reason, /Login password is not configured/);
+  const badUrl = await nodeType("playwright-login").run({ url: "ftp://x", steps: "click #a", module: fake.module }, loginCtx());
+  assert.match(badUrl.reason, /url must be http/);
+  const badToken = await nodeType("playwright-login").run(
+    { url: "https://a.example.com", steps: "click #a", tokenFrom: "header:x", module: fake.module },
+    loginCtx(),
+  );
+  assert.match(badToken.reason, /tokenFrom must be/);
+});
+
+test("playwright-test exports the run's storage state and token file to the suite", async () => {
+  const ctx = nodeCtx({ taskId: `st-${Math.random().toString(16).slice(2, 8)}` });
+  const dir = authDirFor(ctx.taskId);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "storageState.json"), "{}");
+  // the fake CLI echoes its environment into the report file via argv; check the env instead through a tiny bin
+  const binDir = mkdtempSync(join(tmpdir(), "ilmari-pw-envbin-"));
+  const script = join(binDir, "pw.mjs");
+  writeFileSync(
+    script,
+    `import { writeFileSync } from "node:fs";
+     writeFileSync(process.env.PLAYWRIGHT_JSON_OUTPUT_FILE, JSON.stringify({ stats: { expected: 1, unexpected: 0, flaky: 0, skipped: 0, duration: 1 }, suites: [] }));
+     console.log("STATE=" + (process.env.PLAYWRIGHT_STORAGE_STATE ?? ""));`,
+  );
+  const res = await nodeType("playwright-test").run({ bin: `node ${script}` }, ctx);
+  assert.equal(res.ok, true, res.reason);
+  const explicit = await nodeType("playwright-test").run({ bin: `node ${script}`, storageState: "/x/state.json" }, ctx);
+  assert.equal(explicit.ok, true);
+});
+
+test("exposeToken makes the token the step result; the auth_token tool reads it for agents", async () => {
+  const fake = fakePlaywrightModule({ token: "bearer-xyz" });
+  const ctx = loginCtx();
+  const res = await nodeType("playwright-login").run(
+    { url: "https://app.example.com/login", steps: "click #sso", tokenFrom: "localStorage:access_token", exposeToken: true, module: fake.module },
+    ctx,
+  );
+  assert.equal(res.ok, true, res.reason);
+  assert.equal(res.output, "bearer-xyz");
+  const tool = plugin.tools.find((t) => t.name === "auth_token");
+  assert.equal(await tool.execute({}, { workdir: ctx.workdir, taskId: ctx.taskId, pluginConfig: () => ({}) }), "bearer-xyz");
+  assert.match(await tool.execute({}, { workdir: ctx.workdir, taskId: "nope-" + Date.now(), pluginConfig: () => ({}) }), /no playwright-login step/);
+  // exposeToken without tokenFrom is a configuration error, not a silent empty result
+  const bad = await nodeType("playwright-login").run({ url: "https://app.example.com/login", steps: "click #sso", exposeToken: true, module: fake.module }, loginCtx());
+  assert.match(bad.reason, /exposeToken needs tokenFrom/);
 });
