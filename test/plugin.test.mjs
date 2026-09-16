@@ -272,10 +272,10 @@ test("resolveBin keeps a working CLI and falls back to npx only for the default 
   const ctx = nodeCtx();
   const good = resolveBin(fakePlaywrightCli(), ctx, true);
   assert.equal(good.fallback, false);
-  const explicit = resolveBin("node -e 'process.exit(1)'", ctx, true);
+  const explicit = resolveBin("sh -c 'exit 1'", ctx, true);
   assert.match(explicit.error, /not available/);
   // a non-default bin never falls back, whatever the flag says
-  const noFallback = resolveBin("node -e 'process.exit(1)'", ctx, false);
+  const noFallback = resolveBin("sh -c 'exit 1'", ctx, false);
   assert.match(noFallback.error, /not available/);
 });
 
