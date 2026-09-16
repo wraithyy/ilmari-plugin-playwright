@@ -370,7 +370,7 @@ export function authEnvFor(taskId) {
 
 export default {
   name: "ilmari-plugin-playwright",
-  version: "0.3.0",
+  version: "0.3.1",
   description:
     "Runs the project's Playwright end-to-end tests headless as a workflow step and turns the result into a report an agent can act on: which tests failed, where, with which error and which trace or screenshot files. Shards are a parameter, so a map node can run the suite across parallel items. A screenshot step captures app pages on demand, a login step signs into an application (SSO included) and hands the session to the tests, and an install step downloads the browsers.",
   setup:
@@ -482,6 +482,11 @@ export default {
           description: "Command that runs the Playwright CLI (default: npx --no-install playwright).",
           example: "pnpm exec playwright",
         },
+        skipIfMissing: {
+          type: "boolean",
+          description: "When the project has no Playwright CLI (no @playwright/test dependency yet), pass the step with the result `SKIPPED: ...` instead of failing it (default false). For repositories where the e2e suite arrives later; a decide step can treat SKIPPED like PASS.",
+          example: "true",
+        },
         storageState: {
           type: "string",
           description: "Path to a Playwright storageState file, exported to the suite as PLAYWRIGHT_STORAGE_STATE. Empty = the file a playwright-login step of this run saved, when there is one.",
@@ -497,6 +502,13 @@ export default {
         const timeoutSec = Number(rendered.timeoutSec ?? DEFAULT_TIMEOUT_SEC) || DEFAULT_TIMEOUT_SEC;
         const failOnTestFailure =
           rendered.failOnTestFailure !== false && String(rendered.failOnTestFailure) !== "false";
+        if (rendered.skipIfMissing === true || String(rendered.skipIfMissing) === "true") {
+          const probe = resolveBin(bin, ctx, false);
+          if (probe.error) {
+            ctx.emit("playwright_result", { skipped: true, reason: probe.error });
+            return { ok: true, output: `SKIPPED: Playwright is not installed in this project (${bin} not available); no tests ran.` };
+          }
+        }
         const args = buildArgs(rendered);
         const tmp = mkdtempSync(join(tmpdir(), "ilmari-playwright-"));
         const reportFile = join(tmp, "report.json");

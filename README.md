@@ -83,6 +83,7 @@ Received: 0
 | `config` | no | Path to the Playwright config. |
 | `output` | no | Artifact folder (`--output`). |
 | `failOnTestFailure` | no | Default `true`: red tests fail the step. `false`: step succeeds, report starts with `FAIL:`, route with a `decide` node. |
+| `skipIfMissing` | no | Default `false`. `true`: no Playwright CLI in the project -> the step passes with `SKIPPED: ...` instead of failing, for repos whose e2e suite arrives later. |
 | `timeoutSec` | no | Kill and fail after this many seconds (default 1200). |
 | `bin` | no | CLI command (default `npx --no-install playwright`, e.g. `pnpm exec playwright`). |
 

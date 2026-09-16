@@ -194,6 +194,16 @@ test("failOnTestFailure=false turns red tests into a successful step with a FAIL
   assert.match(res.output, /^FAIL:/);
 });
 
+test("skipIfMissing turns a missing Playwright CLI into a passing SKIPPED step", async () => {
+  const ctx = nodeCtx();
+  const res = await nodeType("playwright-test").run({ bin: "sh -c 'exit 1'", skipIfMissing: true }, ctx);
+  assert.equal(res.ok, true, res.reason);
+  assert.match(res.output, /^SKIPPED: Playwright is not installed/);
+  assert.equal(ctx.events.find((e) => e.type === "playwright_result").data.skipped, true);
+  const strict = await nodeType("playwright-test").run({ bin: "sh -c 'exit 1'" }, nodeCtx());
+  assert.equal(strict.ok, false);
+});
+
 test("playwright-test reports the CLI's output tail when no JSON report appears", async () => {
   const res = await nodeType("playwright-test").run({ bin: fakePlaywright(null, 1) }, nodeCtx());
   assert.equal(res.ok, false);
