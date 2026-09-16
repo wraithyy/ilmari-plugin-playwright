@@ -122,14 +122,14 @@ Starts the app (optional `serve` command, stopped afterwards), waits until
 Chromium, and returns the file list:
 
 ```
-Screenshots: 4 file(s) in test-results/screens
-- test-results/screens/home-1280x800.png (http://127.0.0.1:4173/, 1280x800)
-- test-results/screens/home-390x844.png (http://127.0.0.1:4173/, 390x844)
-- test-results/screens/pokemon-25-1280x800.png (http://127.0.0.1:4173/pokemon/25, 1280x800)
-- test-results/screens/pokemon-25-390x844.png (http://127.0.0.1:4173/pokemon/25, 390x844)
+Screenshots: 4 file(s) in /tmp/ilmari-playwright/9333ff5153e49093/screens
+- /tmp/ilmari-playwright/9333ff5153e49093/screens/home-1280x800.png (http://127.0.0.1:4173/, 1280x800)
+- /tmp/ilmari-playwright/9333ff5153e49093/screens/home-390x844.png (http://127.0.0.1:4173/, 390x844)
+- /tmp/ilmari-playwright/9333ff5153e49093/screens/pokemon-25-1280x800.png (http://127.0.0.1:4173/pokemon/25, 1280x800)
+- /tmp/ilmari-playwright/9333ff5153e49093/screens/pokemon-25-390x844.png (http://127.0.0.1:4173/pokemon/25, 390x844)
 
 ```json
-{"files":[{"url":"http://127.0.0.1:4173/","viewport":"1280x800","path":"test-results/screens/home-1280x800.png"}, ...],"failures":[]}
+{"files":[{"url":"http://127.0.0.1:4173/","viewport":"1280x800","path":"/tmp/ilmari-playwright/9333ff5153e49093/screens/home-1280x800.png"}, ...],"failures":[]}
 ```
 ```
 
@@ -143,7 +143,7 @@ Screenshots: 4 file(s) in test-results/screens
 | `fullPage` | no | Default true. |
 | `waitFor` | no | CSS selector to wait for before capturing. |
 | `waitMs` | no | Settle time before each capture (default 1000). |
-| `output` | no | Folder for PNGs (default `screenshots`). |
+| `output` | no | Folder for PNGs. Default: a temp folder outside the worktree (`<tmpdir>/ilmari-playwright/<taskId>/screens`), so a later `deliver` never commits screenshots into the branch; the result lists absolute paths for an upload step. A relative path lands inside the worktree. |
 | `installIfMissing` | no | Default true: no Playwright CLI in the project -> `npx -y playwright@1.55.0` and `install chromium`. |
 | `timeoutSec` | no | Overall deadline (default 600). |
 | `bin` | no | CLI command, as above. |
@@ -160,7 +160,7 @@ subset failing -> step succeeds and lists the failures. Wrap the node in a
   "prompt": "From this plan, list the app paths a reviewer should see, one per line, / first:\n{{plan.result}}" },
 { "id": "shots", "type": "playwright-screenshot", "needs": ["routes"],
   "serve": "pnpm dev --port 4173 --strictPort --host 127.0.0.1",
-  "urls": "{{routes.result}}", "viewports": "1280x800 390x844", "output": "test-results/screens",
+  "urls": "{{routes.result}}", "viewports": "1280x800 390x844",
   "fallback": { "id": "no-shots", "type": "shell", "command": "echo 'screenshots unavailable: {{error}}'" } },
 { "id": "post", "type": "agent", "readOnly": true, "needs": ["shots"],
   "tools": ["mcp__gitlab__upload_markdown", "mcp__gitlab__create_merge_request_note"],

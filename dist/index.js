@@ -12,7 +12,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 const DEFAULT_BIN = "npx --no-install playwright";
 const DEFAULT_TIMEOUT_SEC = 1200;
@@ -215,7 +215,7 @@ function startServer(command, cwd) {
 
 export default {
   name: "ilmari-plugin-playwright",
-  version: "0.2.0",
+  version: "0.2.1",
   description:
     "Runs the project's Playwright end-to-end tests headless as a workflow step and turns the result into a report an agent can act on: which tests failed, where, with which error and which trace or screenshot files. Shards are a parameter, so a map node can run the suite across parallel items. A screenshot step captures app pages on demand, with or without Playwright in the project, and an install step downloads the browsers.",
   setup:
@@ -399,8 +399,8 @@ export default {
         },
         output: {
           type: "string",
-          description: "Folder for the PNG files, relative to the worktree (default screenshots).",
-          example: "test-results/screens",
+          description: "Folder for the PNG files. Default: a temp folder outside the worktree (os tmpdir/ilmari-playwright/<taskId>/screens), so a later deliver never commits them; the result lists absolute paths for an upload step. A relative path lands inside the worktree instead.",
+          example: "/tmp/ilmari-screens",
         },
         installIfMissing: {
           type: "boolean",
@@ -426,7 +426,10 @@ export default {
         const vp = parseViewports(p.viewports);
         if (vp.error) return { ok: false, reason: `playwright-screenshot: ${vp.error}` };
         const baseUrl = String(p.baseUrl ?? "").trim().replace(/\/+$/, "") || DEFAULT_SCREENSHOT_BASE;
-        const outDir = String(p.output ?? "").trim() || "screenshots";
+        // default lands outside the worktree: a later deliver commits whatever is
+        // dirty there, and screenshots belong on the merge request, not in the repo
+        const outDir = String(p.output ?? "").trim() || join(tmpdir(), "ilmari-playwright", ctx.taskId || "run", "screens");
+        const dir = isAbsolute(outDir) ? outDir : join(ctx.workdir, outDir);
         const fullPage = p.fullPage !== false && String(p.fullPage) !== "false";
         const waitMs = Number(p.waitMs ?? 1000) || 1000;
         const waitFor = String(p.waitFor ?? "").trim();
@@ -452,7 +455,6 @@ export default {
               return { ok: false, reason: `playwright-screenshot: ${baseUrl} did not answer after starting "${serveCmd}" (${ready.reason}). Server output tail:\n${tail(server.output(), 25)}` };
             }
           }
-          const dir = join(ctx.workdir, outDir);
           if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
           const files = [];
           const failures = [];
@@ -460,19 +462,19 @@ export default {
             const url = /^https?:\/\//.test(raw) ? raw : `${baseUrl}/${raw.replace(/^\/+/, "")}`;
             for (const { w, h } of vp.viewports) {
               if (Date.now() > deadline) return { ok: false, reason: `playwright-screenshot: deadline reached after ${files.length} screenshots` };
-              const file = join(outDir, `${slugForUrl(url)}-${w}x${h}.png`);
+              const file = join(dir, `${slugForUrl(url)}-${w}x${h}.png`);
               const args = ["screenshot", `--viewport-size=${w},${h}`, `--wait-for-timeout=${waitMs}`];
               if (fullPage) args.push("--full-page");
               if (waitFor) args.push("--wait-for-selector", waitFor);
               args.push(url, file);
               const res = runShell(`${bin} ${args.map(q).join(" ")}`, ctx, 120, {});
-              if (res.status === 0 && existsSync(join(ctx.workdir, file))) files.push({ url, viewport: `${w}x${h}`, path: file });
+              if (res.status === 0 && existsSync(file)) files.push({ url, viewport: `${w}x${h}`, path: file });
               else failures.push(`${url} @ ${w}x${h}: ${tail(res.out, 3).trim() || `exit ${res.status ?? res.signal}`}`);
             }
           }
           ctx.emit("playwright_screenshot_result", { files: files.map((f) => f.path), failures });
           if (!files.length) return { ok: false, reason: `playwright-screenshot: no screenshot captured:\n${failures.join("\n")}` };
-          const lines = [`Screenshots: ${files.length} file(s) in ${outDir}`, ...files.map((f) => `- ${f.path} (${f.url}, ${f.viewport})`)];
+          const lines = [`Screenshots: ${files.length} file(s) in ${dir}`, ...files.map((f) => `- ${f.path} (${f.url}, ${f.viewport})`)];
           if (failures.length) lines.push("", `Failed: ${failures.length}`, ...failures.map((f) => `- ${f}`));
           lines.push("", "```json", JSON.stringify({ files, failures }), "```");
           return { ok: true, output: lines.join("\n") };

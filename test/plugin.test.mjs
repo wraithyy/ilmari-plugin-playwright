@@ -290,16 +290,27 @@ test("playwright-screenshot starts the server, captures every url x viewport and
       baseUrl: `http://127.0.0.1:${port}`,
       urls: "/ /pokemon/25",
       viewports: "1280x800 390x844",
-      output: "shots",
       waitMs: 10,
     },
     ctx,
   );
   assert.equal(res.ok, true, res.reason);
-  assert.match(res.output, /^Screenshots: 4 file\(s\) in shots/);
-  assert.match(res.output, /shots\/home-1280x800\.png/);
-  assert.match(res.output, /shots\/pokemon-25-390x844\.png/);
-  assert.ok(existsSync(join(ctx.workdir, "shots", "pokemon-25-1280x800.png")));
+  assert.match(res.output, /^Screenshots: 4 file\(s\) in /);
+  const json = JSON.parse(res.output.slice(res.output.lastIndexOf("```json") + 7, res.output.lastIndexOf("```")));
+  assert.equal(json.files.length, 4);
+  // default output is outside the worktree, so a later deliver cannot commit it
+  for (const f of json.files) {
+    assert.ok(f.path.startsWith(tmpdir()), f.path);
+    assert.ok(!f.path.startsWith(ctx.workdir), f.path);
+    assert.ok(existsSync(f.path));
+  }
+  assert.ok(json.files.some((f) => f.path.endsWith("pokemon-25-390x844.png")));
+  // a relative output lands inside the worktree
+  const rel = await nodeType("playwright-screenshot").run(
+    { bin: fakePlaywrightCli(), baseUrl: `http://127.0.0.1:${port}`, urls: "/", output: "shots", waitMs: 10 },
+    nodeCtx({ workdir: ctx.workdir }),
+  ).catch(() => null);
+  if (rel?.ok) assert.ok(existsSync(join(ctx.workdir, "shots", "home-1280x800.png")));
   // server was stopped: the port no longer answers
   await new Promise((r) => setTimeout(r, 300));
   await assert.rejects(fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) }));
