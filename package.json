@@ -1,0 +1,17 @@
+{
+  "name": "ilmari-plugin-playwright",
+  "version": "0.1.0",
+  "description": "ilmari plugin: run Playwright tests headless as a workflow step, shard them across parallel map items, and hand agents a structured failure report.",
+  "type": "module",
+  "main": "dist/index.js",
+  "license": "Apache-2.0",
+  "keywords": ["ilmari", "ilmari-plugin", "playwright", "e2e", "testing"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wraithyy/ilmari-plugin-playwright"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {}
+}
