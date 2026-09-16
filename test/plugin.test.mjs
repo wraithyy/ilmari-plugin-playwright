@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -231,6 +231,93 @@ test("entry is statically inspectable with the declared capabilities", async () 
   const { inspectPluginSource } = await import(`${src}/src/plugin-static.ts`);
   const result = inspectPluginSource(readFileSync(new URL("../dist/index.js", import.meta.url), "utf8"));
   assert.equal(result.ok, true, JSON.stringify(result));
-  assert.deepEqual(result.meta.capabilities, ["exec", "fs"]);
-  assert.deepEqual(result.meta.nodeTypes.map((n) => n.type), ["playwright-test", "playwright-install"]);
+  assert.deepEqual(result.meta.capabilities, ["exec", "fs", "net"]);
+  assert.deepEqual(result.meta.nodeTypes.map((n) => n.type), ["playwright-test", "playwright-screenshot", "playwright-install"]);
+});
+
+const { resolveBin, slugForUrl, parseViewports } = await import("../dist/index.js");
+
+/** Fake CLI that also answers --version and writes an empty PNG for `screenshot`. */
+function fakePlaywrightCli() {
+  const dir = mkdtempSync(join(tmpdir(), "ilmari-pw-cli-"));
+  const script = join(dir, "pw.mjs");
+  writeFileSync(
+    script,
+    `import { writeFileSync, mkdirSync } from "node:fs";
+     import { dirname } from "node:path";
+     const [cmd, ...rest] = process.argv.slice(2);
+     if (cmd === "--version") { console.log("Version 1.55.0"); process.exit(0); }
+     if (cmd === "screenshot") {
+       const file = rest.at(-1);
+       mkdirSync(dirname(file), { recursive: true });
+       writeFileSync(file, "png");
+       console.log("shot", JSON.stringify(rest));
+       process.exit(0);
+     }
+     process.exit(2);`,
+  );
+  return `node ${script}`;
+}
+
+test("slugForUrl and parseViewports", () => {
+  assert.equal(slugForUrl("http://127.0.0.1:4173/"), "home");
+  assert.equal(slugForUrl("http://x/pokemon/25?tab=stats"), "pokemon-25-tab-stats");
+  assert.equal(slugForUrl("/"), "home");
+  assert.deepEqual(parseViewports("1280x800 390x844").viewports, [{ w: 1280, h: 800 }, { w: 390, h: 844 }]);
+  assert.deepEqual(parseViewports("").viewports, [{ w: 1280, h: 800 }]);
+  assert.match(parseViewports("big").error, /invalid viewport/);
+});
+
+test("resolveBin keeps a working CLI and falls back to npx only for the default bin", () => {
+  const ctx = nodeCtx();
+  const good = resolveBin(fakePlaywrightCli(), ctx, true);
+  assert.equal(good.fallback, false);
+  const explicit = resolveBin("node -e 'process.exit(1)'", ctx, true);
+  assert.match(explicit.error, /not available/);
+  // a non-default bin never falls back, whatever the flag says
+  const noFallback = resolveBin("node -e 'process.exit(1)'", ctx, false);
+  assert.match(noFallback.error, /not available/);
+});
+
+test("playwright-screenshot starts the server, captures every url x viewport and stops the server", async () => {
+  const ctx = nodeCtx();
+  const port = 4190 + Math.floor(Math.random() * 100);
+  const serve = `node -e "require('node:http').createServer((q,s)=>s.end('ok')).listen(${port})"`;
+  const res = await nodeType("playwright-screenshot").run(
+    {
+      bin: fakePlaywrightCli(),
+      serve,
+      baseUrl: `http://127.0.0.1:${port}`,
+      urls: "/ /pokemon/25",
+      viewports: "1280x800 390x844",
+      output: "shots",
+      waitMs: 10,
+    },
+    ctx,
+  );
+  assert.equal(res.ok, true, res.reason);
+  assert.match(res.output, /^Screenshots: 4 file\(s\) in shots/);
+  assert.match(res.output, /shots\/home-1280x800\.png/);
+  assert.match(res.output, /shots\/pokemon-25-390x844\.png/);
+  assert.ok(existsSync(join(ctx.workdir, "shots", "pokemon-25-1280x800.png")));
+  // server was stopped: the port no longer answers
+  await new Promise((r) => setTimeout(r, 300));
+  await assert.rejects(fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) }));
+});
+
+test("playwright-screenshot fails with the server output when the app never answers", async () => {
+  const res = await nodeType("playwright-screenshot").run(
+    { bin: fakePlaywrightCli(), serve: "node -e \"console.error('boom: port in use'); setTimeout(()=>{}, 100000)\"", baseUrl: "http://127.0.0.1:4599", urls: "/", serveTimeoutSec: 2 },
+    nodeCtx(),
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.reason, /did not answer/);
+  assert.match(res.reason, /boom: port in use/);
+});
+
+test("playwright-screenshot refuses an empty url list and bad viewports", async () => {
+  const none = await nodeType("playwright-screenshot").run({ bin: fakePlaywrightCli(), urls: "" }, nodeCtx());
+  assert.match(none.reason, /no urls/);
+  const bad = await nodeType("playwright-screenshot").run({ bin: fakePlaywrightCli(), urls: "/", viewports: "wide" }, nodeCtx());
+  assert.match(bad.reason, /invalid viewport/);
 });

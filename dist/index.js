@@ -5,10 +5,12 @@
 // and which trace/screenshot files. Shards are first-class so a `map` node can
 // fan the suite out across parallel items.
 //
-// Zero dependencies; Node >= 20.
+// Zero dependencies; Node >= 20. `net` is only used by the screenshot
+// step's fallback (npx download of a pinned Playwright and Chromium) and by
+// its readiness poll of the app under test.
 
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -127,14 +129,98 @@ function runShell(command, ctx, timeoutSec, env) {
 
 const tail = (text, n) => String(text).split("\n").slice(-n).join("\n");
 
+const FALLBACK_BIN = "npx -y playwright@1.55.0";
+const DEFAULT_SCREENSHOT_BASE = "http://127.0.0.1:4173";
+
+/** Pick the Playwright CLI: the project's own when present, else (when
+ *  allowed) a pinned npx download, so screenshots work in a repo that has no
+ *  Playwright dependency at all. Exported for tests. */
+export function resolveBin(bin, ctx, allowFallback) {
+  const probe = spawnSync(`${bin} --version`, { cwd: ctx.workdir, shell: true, encoding: "utf8", timeout: 60_000 });
+  if (probe.status === 0) return { bin, fallback: false };
+  if (!allowFallback || bin !== DEFAULT_BIN) {
+    return { error: `playwright CLI not available via "${bin}": ${tail((probe.stdout ?? "") + (probe.stderr ?? ""), 5)}` };
+  }
+  return { bin: FALLBACK_BIN, fallback: true };
+}
+
+/** "/pokemon/25?x=1" -> "pokemon-25-x-1"; "/" -> "home". Exported for tests. */
+export function slugForUrl(url) {
+  let path = url;
+  try {
+    const u = new URL(url);
+    path = `${u.pathname}${u.search}`;
+  } catch {
+    // relative path already
+  }
+  const slug = path.replace(/^\/+|\/+$/g, "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || "home";
+}
+
+/** Split "1280x800 390x844" into [{w,h}]; invalid entries are reported, not guessed. */
+export function parseViewports(text) {
+  const out = [];
+  for (const part of String(text ?? "").split(/[\s,;]+/).filter(Boolean)) {
+    const m = /^(\d{2,5})x(\d{2,5})$/i.exec(part);
+    if (!m) return { error: `invalid viewport "${part}", expected WIDTHxHEIGHT` };
+    out.push({ w: Number(m[1]), h: Number(m[2]) });
+  }
+  return { viewports: out.length ? out : [{ w: 1280, h: 800 }] };
+}
+
+async function waitForHttp(url, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = "";
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(3000), redirect: "manual" });
+      if (res.status < 500) return { ok: true };
+      lastError = `HTTP ${res.status}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return { ok: false, reason: lastError };
+}
+
+/** Start the app under test in its own process group so the whole tree
+ *  (pnpm -> vite -> esbuild) can be stopped afterwards. */
+function startServer(command, cwd) {
+  const child = spawn(command, { cwd, shell: true, detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, CI: "1" } });
+  let output = "";
+  const collect = (chunk) => {
+    output += String(chunk);
+    if (output.length > 20_000) output = output.slice(-20_000);
+  };
+  child.stdout.on("data", collect);
+  child.stderr.on("data", collect);
+  child.on("error", (e) => collect(`spawn error: ${e.message}\n`));
+  return {
+    child,
+    output: () => output,
+    stop: () => {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // already gone
+        }
+      }
+    },
+  };
+}
+
 export default {
   name: "ilmari-plugin-playwright",
-  version: "0.1.0",
+  version: "0.2.0",
   description:
-    "Runs the project's Playwright end-to-end tests headless as a workflow step and turns the result into a report an agent can act on: which tests failed, where, with which error and which trace or screenshot files. Shards are a parameter, so a map node can run the suite across parallel items. A second step installs the browsers.",
+    "Runs the project's Playwright end-to-end tests headless as a workflow step and turns the result into a report an agent can act on: which tests failed, where, with which error and which trace or screenshot files. Shards are a parameter, so a map node can run the suite across parallel items. A screenshot step captures app pages on demand, with or without Playwright in the project, and an install step downloads the browsers.",
   setup:
     "The project must already depend on @playwright/test (it is run through `npx --no-install playwright`, so nothing is downloaded at run time). Browsers come from the playwright-install step or from a base image that has them. No credentials.",
-  capabilities: ["exec", "fs"],
+  capabilities: ["exec", "fs", "net"],
 
   nodeTypes: [
     {
@@ -261,6 +347,137 @@ export default {
           return { ok: true, output: summary };
         } finally {
           rmSync(tmp, { recursive: true, force: true });
+        }
+      },
+    },
+    {
+      type: "playwright-screenshot",
+      glyph: "",
+      description:
+        "Take screenshots of the application: optionally start it (a dev server command), wait until its URL answers, then capture each listed URL in each viewport with a headless Chromium and stop the server again. Works with or without Playwright in the project: when the repo has no Playwright CLI, a pinned npx download is used (and Chromium installed into the machine's Playwright cache once). Result: a Markdown list of the PNG files written plus a JSON block, ready for an agent to upload to a merge request.",
+      params: {
+        urls: {
+          type: "string",
+          required: true,
+          description: "URLs or app paths to capture, separated by whitespace or newlines. Paths are resolved against baseUrl. {{<nodeId>.result}} from an agent that picked the routes works here.",
+          example: "/ /pokemon/25",
+        },
+        baseUrl: {
+          type: "string",
+          description: "Where the app answers; relative urls are appended to it and readiness is polled here (default http://127.0.0.1:4173).",
+          example: "http://127.0.0.1:4173",
+        },
+        serve: {
+          type: "string",
+          description: "Command that starts the app in the worktree, stopped again after the screenshots. Empty = the app is already running at baseUrl.",
+          example: "pnpm dev --port 4173 --strictPort --host 127.0.0.1",
+        },
+        serveTimeoutSec: {
+          type: "number",
+          description: "How long to wait for baseUrl to answer after starting serve (default 90).",
+          example: "120",
+        },
+        viewports: {
+          type: "string",
+          description: "Viewport sizes as WIDTHxHEIGHT, space separated; one screenshot per url per viewport (default 1280x800).",
+          example: "1280x800 390x844",
+        },
+        fullPage: {
+          type: "boolean",
+          description: "Capture the whole scrollable page (default true) instead of the viewport only.",
+          example: "true",
+        },
+        waitFor: {
+          type: "string",
+          description: "CSS selector that must be present before capturing, for pages that load data first.",
+          example: "main [data-loaded]",
+        },
+        waitMs: {
+          type: "number",
+          description: "Extra settle time in milliseconds before each capture (default 1000).",
+          example: "1500",
+        },
+        output: {
+          type: "string",
+          description: "Folder for the PNG files, relative to the worktree (default screenshots).",
+          example: "test-results/screens",
+        },
+        installIfMissing: {
+          type: "boolean",
+          description: "When the project has no Playwright CLI, fall back to a pinned npx download and install Chromium (default true). Set false to fail instead.",
+          example: "true",
+        },
+        timeoutSec: {
+          type: "number",
+          description: "Overall deadline for the step (default 600).",
+          example: "300",
+        },
+        bin: {
+          type: "string",
+          description: "Command that runs the Playwright CLI (default: npx --no-install playwright).",
+          example: "pnpm exec playwright",
+        },
+      },
+      async run(params, ctx) {
+        const vars = { ...ctx.outputs, task: ctx.taskTitle };
+        const p = Object.fromEntries(Object.entries(params).map(([k, v]) => [k, typeof v === "string" ? render(v, vars) : v]));
+        const urls = String(p.urls ?? "").split(/\s+/).filter(Boolean);
+        if (!urls.length) return { ok: false, reason: "playwright-screenshot: no urls given" };
+        const vp = parseViewports(p.viewports);
+        if (vp.error) return { ok: false, reason: `playwright-screenshot: ${vp.error}` };
+        const baseUrl = String(p.baseUrl ?? "").trim().replace(/\/+$/, "") || DEFAULT_SCREENSHOT_BASE;
+        const outDir = String(p.output ?? "").trim() || "screenshots";
+        const fullPage = p.fullPage !== false && String(p.fullPage) !== "false";
+        const waitMs = Number(p.waitMs ?? 1000) || 1000;
+        const waitFor = String(p.waitFor ?? "").trim();
+        const deadline = Date.now() + (Number(p.timeoutSec ?? 600) || 600) * 1000;
+        const allowFallback = p.installIfMissing !== false && String(p.installIfMissing) !== "false";
+
+        const resolved = resolveBin(String(p.bin ?? "").trim() || DEFAULT_BIN, ctx, allowFallback);
+        if (resolved.error) return { ok: false, reason: `playwright-screenshot: ${resolved.error}` };
+        const bin = resolved.bin;
+        if (resolved.fallback) {
+          // no Playwright in the project: make sure a browser exists once, cached per machine
+          const inst = runShell(`${bin} install chromium`, ctx, 600, {});
+          if (inst.status !== 0) return { ok: false, reason: `playwright-screenshot: chromium install failed:\n${tail(inst.out, 15)}` };
+        }
+        ctx.emit("playwright_screenshot_started", { urls, baseUrl, bin, serve: String(p.serve ?? "") });
+
+        const serveCmd = String(p.serve ?? "").trim();
+        const server = serveCmd ? startServer(serveCmd, ctx.workdir) : null;
+        try {
+          if (server) {
+            const ready = await waitForHttp(baseUrl, (Number(p.serveTimeoutSec ?? 90) || 90) * 1000);
+            if (!ready.ok) {
+              return { ok: false, reason: `playwright-screenshot: ${baseUrl} did not answer after starting "${serveCmd}" (${ready.reason}). Server output tail:\n${tail(server.output(), 25)}` };
+            }
+          }
+          const dir = join(ctx.workdir, outDir);
+          if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+          const files = [];
+          const failures = [];
+          for (const raw of urls) {
+            const url = /^https?:\/\//.test(raw) ? raw : `${baseUrl}/${raw.replace(/^\/+/, "")}`;
+            for (const { w, h } of vp.viewports) {
+              if (Date.now() > deadline) return { ok: false, reason: `playwright-screenshot: deadline reached after ${files.length} screenshots` };
+              const file = join(outDir, `${slugForUrl(url)}-${w}x${h}.png`);
+              const args = ["screenshot", `--viewport-size=${w},${h}`, `--wait-for-timeout=${waitMs}`];
+              if (fullPage) args.push("--full-page");
+              if (waitFor) args.push("--wait-for-selector", waitFor);
+              args.push(url, file);
+              const res = runShell(`${bin} ${args.map(q).join(" ")}`, ctx, 120, {});
+              if (res.status === 0 && existsSync(join(ctx.workdir, file))) files.push({ url, viewport: `${w}x${h}`, path: file });
+              else failures.push(`${url} @ ${w}x${h}: ${tail(res.out, 3).trim() || `exit ${res.status ?? res.signal}`}`);
+            }
+          }
+          ctx.emit("playwright_screenshot_result", { files: files.map((f) => f.path), failures });
+          if (!files.length) return { ok: false, reason: `playwright-screenshot: no screenshot captured:\n${failures.join("\n")}` };
+          const lines = [`Screenshots: ${files.length} file(s) in ${outDir}`, ...files.map((f) => `- ${f.path} (${f.url}, ${f.viewport})`)];
+          if (failures.length) lines.push("", `Failed: ${failures.length}`, ...failures.map((f) => `- ${f}`));
+          lines.push("", "```json", JSON.stringify({ files, failures }), "```");
+          return { ok: true, output: lines.join("\n") };
+        } finally {
+          server?.stop();
         }
       },
     },
