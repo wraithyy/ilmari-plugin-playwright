@@ -175,12 +175,20 @@ subset failing -> step succeeds and lists the failures. Wrap the node in a
   "prompt": "From this plan, list the app paths a reviewer should see, one per line, / first:\n{{plan.result}}" },
 { "id": "shots", "type": "playwright-screenshot", "needs": ["routes"],
   "serve": "pnpm dev --port 4173 --strictPort --host 127.0.0.1",
-  "urls": "{{routes.result}}", "viewports": "1280x800 390x844",
+  "urls": "{{routes.result}}", "viewports": "1280x800 390x844", "output": ".ilmari-screens",
   "fallback": { "id": "no-shots", "type": "shell", "command": "echo 'screenshots unavailable: {{error}}'" } },
-{ "id": "post", "type": "agent", "readOnly": true, "needs": ["shots"],
+{ "id": "files", "type": "shell", "needs": ["shots"],
+  "command": "find .ilmari-screens -name '*.png'; true" },
+{ "id": "post", "type": "agent", "readOnly": true, "needs": ["files"],
   "tools": ["mcp__gitlab__upload_markdown", "mcp__gitlab__create_merge_request_note"],
-  "prompt": "Upload these files to the MR and post them as one comment:\n{{shots.result}}" }
+  "prompt": "Upload these files (paths relative to the repo root) to the MR and post them as one comment:\n{{files.result}}" }
 ```
+
+Upload tools such as `@zereight/mcp-gitlab`'s `upload_markdown` only read
+files under their own cwd (the worktree) and reject absolute paths. For
+those, point `output` at a folder inside the worktree, add it to the
+project's `.gitignore` so `deliver` never commits it, and hand the agent
+relative paths.
 
 ## Node type: `playwright-login`
 
